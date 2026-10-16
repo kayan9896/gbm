@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from probability import estimate_vol, hit_range
 
 YAHOO = "https://query1.finance.yahoo.com"
 HEADERS = {
@@ -31,6 +35,10 @@ RANGE_MAP = {
 
 INTRADAY = {"1d", "5d"}
 
+# symbol -> (fetched_at_epoch, [daily closes, oldest first]); 10-minute TTL
+_vol_cache: dict[str, tuple[float, list[float]]] = {}
+_VOL_TTL = 600
+
 app = FastAPI(title="Tickline")
 http = httpx.AsyncClient(headers=HEADERS, timeout=20.0, follow_redirects=True)
 
@@ -40,6 +48,65 @@ def yahoo_symbol(raw: str) -> str:
     if not symbol:
         raise HTTPException(status_code=400, detail="Ticker is required")
     return symbol.replace(".", "-")
+
+
+async def daily_closes_1y(ticker: str) -> list[float]:
+    """1 year of daily closes for volatility estimation (cached briefly)."""
+    now = time.time()
+    hit = _vol_cache.get(ticker)
+    if hit and now - hit[0] < _VOL_TTL:
+        return hit[1]
+    try:
+        response = await http.get(
+            f"{YAHOO}/v8/finance/chart/{ticker}",
+            params={"range": "1y", "interval": "1d", "events": "div,splits"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Price data is unavailable right now") from exc
+    results = (payload.get("chart") or {}).get("result") or []
+    if not results:
+        raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+    quote = ((results[0].get("indicators") or {}).get("quote") or [{}])[0]
+    closes = [c for c in (quote.get("close") or []) if isinstance(c, (int, float)) and c > 0]
+    if len(closes) < 60:
+        raise HTTPException(status_code=502, detail="Not enough history to estimate volatility")
+    _vol_cache[ticker] = (now, closes)
+    return closes
+
+
+class ProbRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+    price: float = Field(..., gt=0)
+    target: float = Field(..., gt=0)
+    years: float = Field(0.5, gt=0, le=5)
+    risk_free: float = Field(0.04, ge=0, le=1)
+    drift: float | None = Field(None, ge=-1, le=5)
+
+
+@app.post("/api/probability")
+async def probability(req: ProbRequest):
+    """P(price touches `target` at least once within `years`), as a range.
+
+    GBM first-passage model (same math as tools/barrier_prob.py). Volatility
+    is the 1y realized daily vol, bracketed 0.7x/1x/1.3x; drifts are 0%,
+    the risk-free rate, and an optional custom drift.
+    """
+    if req.target == req.price:
+        raise HTTPException(status_code=400, detail="Target equals the starting price")
+    ticker = yahoo_symbol(req.symbol)
+    closes = await daily_closes_1y(ticker)
+    base_vol = estimate_vol(closes)
+    grid = hit_range(req.price, req.target, req.years, base_vol, req.risk_free, req.drift)
+    return {
+        "symbol": ticker,
+        "price": req.price,
+        "target": req.target,
+        "years": req.years,
+        "direction": "up" if req.target > req.price else "down",
+        **grid,
+    }
 
 
 @app.get("/api/search")

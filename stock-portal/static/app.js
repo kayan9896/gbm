@@ -8,9 +8,10 @@ const priceEl = document.getElementById("price");
 const changeEl = document.getElementById("change");
 const metaEl = document.getElementById("meta");
 const chartHost = document.getElementById("chart");
+const chartWrap = document.querySelector(".chart-wrap");
 
 const money = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
-const state = { symbol: "AAPL", range: "6mo", chart: null, series: null, timer: null };
+const state = { symbol: "AAPL", range: "6mo", chart: null, series: null, timer: null, points: [], pointByTime: new Map(), popup: null, popupPoint: null };
 
 function formatPrice(value, currency) {
   try {
@@ -51,6 +52,7 @@ function createChart() {
   window.addEventListener("resize", () => {
     chart.applyOptions({ width: chartHost.clientWidth, height: chartHost.clientHeight });
   });
+  chart.subscribeClick(onChartClick);
   state.chart = chart;
   state.series = series;
 }
@@ -88,8 +90,11 @@ async function loadChart(symbol, range) {
       bottomColor: rising ? "rgba(200,240,122,0.02)" : "rgba(255,122,98,0.02)",
     });
     state.series.setData(data.points);
+    state.points = data.points;
+    state.pointByTime = new Map(data.points.map((p) => [p.time, p]));
+    closePopup();
     state.chart.timeScale().fitContent();
-    statusEl.textContent = `${data.points.length} prints · interval ${data.interval}`;
+    statusEl.textContent = `${data.points.length} prints · interval ${data.interval} · click a point for target odds`;
   } catch (error) {
     statusEl.textContent = error.message;
   }
@@ -164,3 +169,166 @@ document.addEventListener("click", (event) => {
 
 createChart();
 loadChart(state.symbol, state.range);
+
+/* ---- target-probability popup ----
+ * Click a data point -> popup with a target-price input. Calculate posts to
+ * /api/probability (GBM first-passage model, same math as
+ * tools/barrier_prob.py) and renders P(reaching the target) as a range
+ * over volatility/drift scenarios. */
+
+function formatPointTime(t) {
+  if (typeof t === "number") {
+    return new Date(t * 1000).toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+  }
+  return t;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function onChartClick(param) {
+  if (!param || param.time == null || !param.point) {
+    closePopup();
+    return;
+  }
+  const point = state.pointByTime.get(param.time);
+  if (!point) {
+    closePopup();
+    return;
+  }
+  openPopup(point, param.point);
+}
+
+function closePopup() {
+  if (state.popup) {
+    state.popup.remove();
+    state.popup = null;
+    state.popupPoint = null;
+  }
+}
+
+function openPopup(point, at) {
+  closePopup();
+  state.popupPoint = point;
+  const el = document.createElement("div");
+  el.className = "prob-popup";
+  const defaultTarget = (point.value * 1.1).toFixed(2);
+  el.innerHTML = `
+    <div class="pp-head">
+      <span><b>${escapeHtml(state.symbol)}</b> · ${escapeHtml(formatPointTime(point.time))} · <b>${money.format(point.value)}</b></span>
+      <button type="button" class="pp-x" aria-label="Close">×</button>
+    </div>
+    <div class="pp-body">
+      <label>Target price
+        <input id="pp-target" type="number" step="0.01" min="0.01" value="${defaultTarget}">
+      </label>
+      <label>Horizon
+        <select id="pp-years">
+          <option value="0.25">3 months</option>
+          <option value="0.5" selected>6 months</option>
+          <option value="1">1 year</option>
+        </select>
+      </label>
+      <div class="pp-row">
+        <label>Risk-free %
+          <input id="pp-rf" type="number" step="0.1" value="4">
+        </label>
+        <label>Extra drift %
+          <input id="pp-drift" type="number" step="0.1" placeholder="optional">
+        </label>
+      </div>
+      <button type="button" class="pp-go" id="pp-calc">Calculate</button>
+      <div class="pp-result" id="pp-result"></div>
+      <p class="pp-caveat">GBM first-passage model (smooth diffusion). Jumps around events make true tail risk fatter than shown.</p>
+    </div>`;
+  chartWrap.appendChild(el);
+  const pw = el.offsetWidth;
+  const ph = el.offsetHeight;
+  const cw = chartWrap.clientWidth;
+  const ch = chartWrap.clientHeight;
+  let x = at.x + 14;
+  let y = at.y - ph - 10;
+  if (x + pw > cw) x = at.x - pw - 14;
+  if (y < 0) y = at.y + 18;
+  if (y + ph > ch) y = Math.max(8, ch - ph - 8);
+  el.style.left = `${Math.max(8, x)}px`;
+  el.style.top = `${Math.max(8, y)}px`;
+  el.querySelector(".pp-x").addEventListener("click", closePopup);
+  el.querySelector("#pp-calc").addEventListener("click", calcProbability);
+  el.querySelector("#pp-target").select();
+  state.popup = el;
+}
+
+async function calcProbability() {
+  const out = document.getElementById("pp-result");
+  const point = state.popupPoint;
+  if (!point) return;
+  const target = parseFloat(document.getElementById("pp-target").value);
+  const years = parseFloat(document.getElementById("pp-years").value);
+  const rf = parseFloat(document.getElementById("pp-rf").value) / 100;
+  const driftRaw = document.getElementById("pp-drift").value.trim();
+  if (!Number.isFinite(target) || target <= 0) {
+    out.innerHTML = `<p class="pp-err">Enter a positive target price.</p>`;
+    return;
+  }
+  if (!Number.isFinite(rf) || rf < 0) {
+    out.innerHTML = `<p class="pp-err">Enter a risk-free rate.</p>`;
+    return;
+  }
+  const drift = driftRaw === "" ? null : parseFloat(driftRaw) / 100;
+  if (drift !== null && !Number.isFinite(drift)) {
+    out.innerHTML = `<p class="pp-err">Enter a valid drift.</p>`;
+    return;
+  }
+  out.innerHTML = `<p class="pp-loading">Calculating…</p>`;
+  try {
+    const res = await fetch("/api/probability", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: state.symbol,
+        price: point.value,
+        target,
+        years,
+        risk_free: rf,
+        drift,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Calculation failed");
+    renderProbResult(out, data, target, years);
+  } catch (error) {
+    out.innerHTML = `<p class="pp-err">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderProbResult(out, data, target, years) {
+  const dir = data.direction === "up" ? "reach or exceed" : "fall to or below";
+  const yrs = years === 0.25 ? "3 months" : years === 0.5 ? "6 months" : years === 1 ? "1 year" : `${years}y`;
+  const gate =
+    data.hi >= 0.8
+      ? `<span class="badge yes">upper bound ≥ 80% ✓</span>`
+      : `<span class="badge no">upper bound &lt; 80%</span>`;
+  const vols = [...new Set(data.cells.map((c) => c.vol))];
+  const drifts = [...new Set(data.cells.map((c) => c.drift))];
+  let tbl = `<table class="pp-table"><tr><th>drift \\ vol</th>${vols.map((v) => `<th>${escapeHtml(v)}</th>`).join("")}</tr>`;
+  for (const d of drifts) {
+    tbl += `<tr><td>${escapeHtml(d)}</td>`;
+    for (const v of vols) {
+      const c = data.cells.find((c) => c.drift === d && c.vol === v);
+      tbl += `<td>${(c.p * 100).toFixed(1)}%</td>`;
+    }
+    tbl += `</tr>`;
+  }
+  tbl += `</table>`;
+  out.innerHTML = `
+    <p class="pp-range">P(${dir} <b>${money.format(target)}</b> within ${yrs})<br>
+      <b class="pp-big">${(data.lo * 100).toFixed(0)}% – ${(data.hi * 100).toFixed(0)}%</b> ${gate}</p>
+    ${tbl}
+    <p class="pp-muted">Range across vol (0.7×/1×/1.3× of ${(data.base_vol * 100).toFixed(1)}% realized 1y vol) and drift scenarios.</p>`;
+}
